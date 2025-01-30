@@ -1,0 +1,144 @@
+name: CI/CD
+
+on:
+  # Pull request events (opened, updated, reopened) -> Lint only
+  pull_request:
+    branches: [ "main" ]
+    types: [opened, synchronize, reopened]
+  # Push events (merging into main) -> Build & Deploy
+  push:
+    branches: [ "main" ]
+
+env:
+  AWS_REGION: "us-east-1"
+  AWS_ACCOUNT_ID: "ACCOUNT_ID"
+  AWS_DEPLOY_ROLE_ARN: "arn:aws:iam::ACCOUNT_ID:role/GitHubActionsDeploymentRole"
+
+  REPO_NAME: "myorg/frontend"
+  ECS_TASK_DEFINITION: "frontend"
+  ECS_SERVICE: "frontend-service"
+  ECS_CLUSTER: "my-ecs-cluster"
+
+jobs:
+  lint-pr:
+    name: Lint on Pull Request
+    runs-on: ubuntu-latest
+    # Only run if event == pull_request
+    if: ${{ github.event_name == 'pull_request' }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      # Example of linting for Node.js
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Lint
+        run: npm run lint
+
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    # Only run if event == push
+    if: ${{ github.event_name == 'push' }}
+
+    # We'll output the Docker image tag for the deploy job
+    outputs:
+      image_tag: ${{ steps.image_info.outputs.image_tag }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} \
+            | docker login --username AWS \
+              --password-stdin ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+
+      - name: Build & Push Docker Image
+        id: image_info
+        run: |
+          IMAGE_URI="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.REPO_NAME }}"
+          IMAGE_TAG="${GITHUB_SHA}"
+
+          echo "Building image: $IMAGE_URI:$IMAGE_TAG"
+          docker build -t $IMAGE_URI:$IMAGE_TAG .
+          docker push $IMAGE_URI:$IMAGE_TAG
+
+          # Expose the image tag for the next job
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' }}
+    needs: [ build ]
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get the task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+            --query "taskDefinition" \
+            > task-definition-tmp.json
+
+      - name: Clean the task definition JSON
+        run: |
+          jq '{
+            containerDefinitions,
+            family,
+            networkMode,
+            taskRoleArn,
+            executionRoleArn,
+            volumes,
+            placementConstraints,
+            requiresCompatibilities,
+            cpu,
+            memory
+          }' task-definition-tmp.json > ./${{ env.ECS_TASK_DEFINITION }}
+          rm task-definition-tmp.json
+
+      - name: Update container image
+        run: |
+          IMAGE_URI="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.REPO_NAME }}"
+          IMAGE_TAG="${{ needs.build.outputs.image_tag }}"
+          
+          echo "Updating container image to: $IMAGE_URI:$IMAGE_TAG"
+          jq --arg IMAGE "$IMAGE_URI:$IMAGE_TAG" \
+             '.containerDefinitions[0].image = $IMAGE' \
+             ./${{ env.ECS_TASK_DEFINITION }} > new-task-def.json
+          mv new-task-def.json ./${{ env.ECS_TASK_DEFINITION }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: false
+          force-new-deployment: true
